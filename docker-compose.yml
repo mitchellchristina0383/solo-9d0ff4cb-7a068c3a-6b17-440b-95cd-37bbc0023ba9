@@ -34,8 +34,15 @@ services:
       PROBE_TIMEOUT: "1.5"
       REQUEST_TIMEOUT: "15"
       DRAIN_DEFAULT_TIMEOUT: "30"
+      RECEIPTS_DB_PATH: "/data/receipts.sqlite3"
+      RECEIPT_BODY_LIMIT: "4096"
+    volumes:
+      - receipts:/data
     ports:
       - "18080:8000"
     depends_on:
       - upstream1
       - upstream2
+
+volumes:
+  receipts:

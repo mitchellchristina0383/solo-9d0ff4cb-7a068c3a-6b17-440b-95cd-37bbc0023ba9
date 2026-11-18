@@ -15,14 +15,24 @@
   11. /docs 可打开
   12. 排空等待超时 -> 202，在途数准确
   13. 上游挂起 -> 网关请求超时 504，不虚报成功、在途归零
+  14. 多并发在途请求排空
+  15. 未知节点 404
+  16. 成功转发回执：响应头编号 + 按编号查询节点/网关状态/上游结果
+  17. 并发请求回执互不覆盖（编号唯一、内容一一对应）
+  18. 无可接流节点：503 也留下拒绝原因回执
+  19. 上游超时：回执未确认，不写成功
+  20. 客户端断开：回执未确认，在途归零
+  21. 进程被强杀后重启：未结束回执标记为 unconfirmed_after_restart
 """
 from __future__ import annotations
 
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -35,6 +45,9 @@ PYTHON = sys.executable
 GW_PORT = 19080
 U1_PORT = 19081
 U2_PORT = 19082
+
+RECEIPTS_DIR = tempfile.mkdtemp(prefix="gw-receipts-")
+RECEIPTS_DB = os.path.join(RECEIPTS_DIR, "receipts.sqlite3")
 
 passed = 0
 failed = 0
@@ -109,6 +122,13 @@ def kill(proc: subprocess.Popen) -> None:
             proc.kill()
 
 
+def kill_hard(proc: subprocess.Popen) -> None:
+    """强杀：模拟进程崩溃/断电，验证重启修复路径。"""
+    if proc.poll() is None:
+        proc.send_signal(signal.SIGKILL)
+        proc.wait(timeout=8)
+
+
 def node_status(node: str) -> dict:
     status, body = jget(f"http://127.0.0.1:{GW_PORT}/admin/status")
     assert status == 200
@@ -118,6 +138,54 @@ def node_status(node: str) -> dict:
 def set_mode(port: int, mode: str) -> None:
     status, _, body = http("POST", f"http://127.0.0.1:{port}/control/mode?mode={mode}")
     assert status == 200, body
+
+
+def receipt(receipt_id: str) -> dict:
+    status, body = jget(f"http://127.0.0.1:{GW_PORT}/receipts/{receipt_id}")
+    assert status == 200, body
+    return body
+
+
+def find_receipt(predicate, limit: int = 50, timeout: float = 6.0) -> dict | None:
+    """轮询回执列表直到出现满足条件的回执（用于在途/断开等异步场景）。"""
+    deadline = time.time() + timeout
+    last = []
+    while time.time() < deadline:
+        status, body = jget(f"http://127.0.0.1:{GW_PORT}/receipts?limit={limit}")
+        assert status == 200, body
+        last = body["items"]
+        for item in last:
+            if predicate(item):
+                return item
+        time.sleep(0.1)
+    print(f"    (未找到匹配回执，最近 {len(last)} 条: {[i.get('outcome') for i in last[:5]]})")
+    return None
+
+
+def wait_eligible(*names: str, timeout: float = 10.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        _, body = jget(f"http://127.0.0.1:{GW_PORT}/admin/status")
+        eligible = set(body["eligible_nodes"])
+        if all(n in eligible for n in names):
+            return True
+        time.sleep(0.15)
+    return False
+
+
+def resume_all() -> None:
+    for name in ("node1", "node2"):
+        http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/{name}/resume")
+
+
+def open_slow_socket(path: str) -> socket.socket:
+    """建立原始连接发 GET 但不读取响应，便于模拟客户端中途断开。"""
+    sock = socket.create_connection(("127.0.0.1", GW_PORT), timeout=5)
+    sock.sendall(
+        f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{GW_PORT}\r\n"
+        "Connection: close\r\n\r\n".encode()
+    )
+    return sock
 
 
 def main() -> int:
@@ -136,6 +204,7 @@ def main() -> int:
             "PROBE_TIMEOUT": "1",
             "REQUEST_TIMEOUT": "15",
             "DRAIN_DEFAULT_TIMEOUT": "10",
+            "RECEIPTS_DB_PATH": RECEIPTS_DB,
         }
         gw = spawn(os.path.join(ROOT, "gateway"), GW_PORT, gw_env)
         procs.append(gw)
@@ -414,6 +483,172 @@ def main() -> int:
         check("排空未知节点返回 404", status == 404, body)
         status, _, body = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/ghost/resume")
         check("恢复未知节点返回 404", status == 404, body)
+
+        # 16. 成功转发回执：响应头编号 + 按编号查询
+        print("== 16. 成功转发的持久回执 ==")
+        resume_all()
+        assert wait_eligible("node1", "node2"), "节点未恢复可接流"
+        status, headers, body = http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/echo?tag=receipt")
+        rid16 = headers.get("x-receipt-id")
+        check("成功响应带 X-Receipt-Id", status == 200 and bool(rid16), f"{status} {headers}")
+        r16 = receipt(rid16)
+        check("回执可查询且为 completed", r16["state"] == "completed", str(r16))
+        check("回执记录选中节点且与响应头一致",
+              r16["node"] == headers.get("x-upstream-node") == json.loads(body)["node"], str(r16))
+        check("回执网关状态与上游状态均为 200",
+              r16["gw_status"] == 200 and r16["upstream_status"] == 200, str(r16))
+        check("回执 outcome=upstream_ok 且 confirmed=true",
+              r16["outcome"] == "upstream_ok" and r16["confirmed"] is True, str(r16))
+        check("回执保留上游结果与查询串",
+              '"tag":"receipt"' in (r16["upstream_body"] or "")
+              and "tag=receipt" in (r16["query"] or ""), str(r16))
+        status, _, body = http("GET", f"http://127.0.0.1:{GW_PORT}/receipts/does-not-exist")
+        check("未知回执返回 404", status == 404, body)
+
+        # 17. 并发请求回执互不覆盖
+        print("== 17. 并发回执互不覆盖 ==")
+        results17: list[tuple[int, str, int]] = []
+        lock = threading.Lock()
+
+        def call17(i: int) -> None:
+            s, h, b = http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/echo?seq={i}", timeout=20)
+            with lock:
+                results17.append((i, h.get("x-receipt-id", ""), s))
+
+        threads17 = [threading.Thread(target=call17, args=(i,)) for i in range(12)]
+        for th in threads17:
+            th.start()
+        for th in threads17:
+            th.join(timeout=25)
+        rids17 = [rid for _, rid, _ in results17]
+        check("12 个并发请求全部成功且各带回编号",
+              len(results17) == 12 and all(s == 200 and rid for _, rid, s in results17),
+              str(results17))
+        check("12 个编号互不重复", len(set(rids17)) == 12, str(rids17))
+        mismatched = []
+        for i, rid, _ in results17:
+            row = receipt(rid)
+            expected = f"seq={i}"
+            if row["state"] != "completed" or expected not in (row["query"] or "") \
+                    or row["confirmed"] is not True:
+                mismatched.append((i, row))
+        check("每条回执内容与自己的请求一一对应", not mismatched, str(mismatched[:2]))
+
+        # 18. 无可用节点：503 也留拒绝原因回执
+        print("== 18. 无可接流节点留下拒绝回执 ==")
+        for name in ("node1", "node2"):
+            status, _, _ = http(
+                "POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/{name}/drain?timeout=5"
+            )
+            assert status == 200
+        status, headers, body = http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/echo")
+        rid18 = headers.get("x-receipt-id")
+        check("503 响应带回执编号", status == 503 and bool(rid18), f"{status} {headers}")
+        r18 = receipt(rid18)
+        check("拒绝回执记录原因且节点为空",
+              r18["outcome"] == "no_eligible_upstream" and r18["node"] is None
+              and r18["gw_status"] == 503, str(r18))
+        check("拒绝回执不算成功", r18["confirmed"] is False, str(r18))
+
+        # 19. 上游超时：回执未确认，绝不写成功
+        print("== 19. 上游超时回执未确认 ==")
+        # 先重启为短超时网关（上游此时仍 healthy，首轮探测能通过）
+        kill(gw)
+        procs.remove(gw)
+        timeout_env = dict(gw_env)
+        timeout_env["REQUEST_TIMEOUT"] = "1"
+        timeout_env["PROBE_INTERVAL"] = "30"  # 避免探测抢先把节点摘掉
+        gw = spawn(os.path.join(ROOT, "gateway"), GW_PORT, timeout_env)
+        procs.append(gw)
+        assert wait_ready(f"http://127.0.0.1:{GW_PORT}/docs")
+        assert wait_eligible("node1", "node2"), "重启后节点未恢复可接流"
+        set_mode(U1_PORT, "hang")
+        set_mode(U2_PORT, "hang")
+        status, headers, body = http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/flaky", timeout=10)
+        rid19 = headers.get("x-receipt-id")
+        if status == 503:
+            # 极偶发：首轮探测恰好在切 hang 之后，节点被判不健康；恢复后重试一次
+            set_mode(U1_PORT, "healthy")
+            set_mode(U2_PORT, "healthy")
+            resume_all()
+            assert wait_eligible("node1", "node2"), "节点未恢复可接流"
+            set_mode(U1_PORT, "hang")
+            set_mode(U2_PORT, "hang")
+            status, headers, body = http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/flaky", timeout=10)
+            rid19 = headers.get("x-receipt-id")
+        check("上游挂起返回 504 且带编号", status == 504 and bool(rid19), f"{status} {headers} {body}")
+        r19 = receipt(rid19)
+        check("超时回执 outcome=upstream_timeout 且未确认",
+              r19["outcome"] == "upstream_timeout" and r19["confirmed"] is False
+              and r19["gw_status"] == 504, str(r19))
+        check("超时回执无上游状态/结果", r19["upstream_status"] is None, str(r19))
+        check("超时回执仍有选中节点", r19["node"] in ("node1", "node2"), str(r19))
+        check("超时后在途归零",
+              all(node_status(n)["inflight"] == 0 for n in ("node1", "node2")))
+        set_mode(U1_PORT, "healthy")
+        set_mode(U2_PORT, "healthy")
+
+        # 20. 客户端中途断开：回执未确认，在途归零
+        print("== 20. 客户端断开回执未确认 ==")
+        kill(gw)
+        procs.remove(gw)
+        gw = spawn(os.path.join(ROOT, "gateway"), GW_PORT, gw_env)
+        procs.append(gw)
+        assert wait_ready(f"http://127.0.0.1:{GW_PORT}/docs")
+        assert wait_eligible("node1", "node2"), "重启后节点未恢复可接流"
+        before = time.time()
+        sock = open_slow_socket("/proxy/slow?seconds=8")
+        # 等请求确实进入在途
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if any(node_status(n)["inflight"] > 0 for n in ("node1", "node2")):
+                break
+            time.sleep(0.1)
+        time.sleep(0.4)
+        sock.close()  # 客户端断开
+        r20 = find_receipt(
+            lambda r: r["path"] == "slow" and r["query"] == "seconds=8"
+            and r["state"] == "completed", 20, 8
+        )
+        check("断开请求留下了终态回执", r20 is not None, str(r20))
+        if r20:
+            check("断开回执 outcome=client_disconnected",
+                  r20["outcome"] == "client_disconnected", str(r20))
+            check("断开回执不算成功且标记了断开",
+                  r20["confirmed"] is False and r20["client_disconnected"] is True, str(r20))
+            check("断开回执不写入成功的上游结果",
+                  r20["outcome"] != "upstream_ok", str(r20))
+        # 在途计数必须在断开后很快归零（上游 8 秒 задача 应被取消，不需要等满）
+        deadline = time.time() + 4
+        while time.time() < deadline:
+            if all(node_status(n)["inflight"] == 0 for n in ("node1", "node2")):
+                break
+            time.sleep(0.1)
+        check("客户端断开后在途快速归零",
+              all(node_status(n)["inflight"] == 0 for n in ("node1", "node2")),
+              f"elapsed={time.time() - before:.1f}s")
+
+        # 21. 重启后未结束回执标记为 unconfirmed_after_restart
+        print("== 21. 重启后未结束回执标记未确认 ==")
+        sock2 = open_slow_socket("/proxy/slow?seconds=30")
+        time.sleep(1.0)
+        open_receipt = find_receipt(lambda r: r["state"] == "in_flight", 20, 3)
+        check("重启前存在 in_flight 回执", open_receipt is not None, str(open_receipt))
+        rid21 = open_receipt["receipt_id"] if open_receipt else ""
+        kill_hard(gw)  # SIGKILL：不给进程写终态的机会，模拟崩溃
+        procs.remove(gw)
+        sock2.close()
+        gw = spawn(os.path.join(ROOT, "gateway"), GW_PORT, gw_env)
+        procs.append(gw)
+        assert wait_ready(f"http://127.0.0.1:{GW_PORT}/docs")
+        r21 = receipt(rid21) if rid21 else {}
+        check("重启后回执被标记 unconfirmed_after_restart",
+              r21.get("state") == "completed"
+              and r21.get("outcome") == "unconfirmed_after_restart", str(r21))
+        check("重启修复的回执不算成功", r21.get("confirmed") is False, str(r21))
+        status, body = jget(f"http://127.0.0.1:{GW_PORT}/admin/status")
+        check("状态 API 报告启动时修复的未确认回执数 >= 1",
+              body.get("unconfirmed_open_at_startup", 0) >= 1, str(body))
 
         print(f"\n==== 结果: {passed} passed, {failed} failed ====")
         return 1 if failed else 0
